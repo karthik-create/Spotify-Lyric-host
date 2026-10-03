@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lyrics Bridge</title>
+<style>
+  :root { --bg:#121212; --card:#1e1e1e; --fg:#eee; --dim:#999; --accent:#1db954; --bad:#e5534b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); padding:16px; max-width:520px; margin-inline:auto; }
+  h1 { font-size:1.3rem; margin:0 0 12px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
+  label { display:block; font-size:.85rem; color:var(--dim); margin-bottom:4px; }
+  input[type=text] { width:100%; padding:10px; border-radius:8px; border:1px solid #333; background:#111; color:var(--fg); font-size:1rem; }
+  button { background:var(--accent); color:#000; border:0; border-radius:999px; padding:10px 18px; font-weight:600; font-size:1rem; margin:8px 8px 0 0; }
+  button.secondary { background:#333; color:var(--fg); }
+  .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--bad); display:inline-block; }
+  .dot.on { background:var(--accent); }
+  #now { font-weight:600; }
+  #artist { color:var(--dim); }
+  #lyric { font-size:1.2rem; min-height:3em; margin-top:10px; }
+  #log { font-family: ui-monospace, monospace; font-size:.75rem; color:var(--dim); max-height:140px; overflow:auto; white-space:pre-wrap; }
+  .small { font-size:.8rem; color:var(--dim); }
+</style>
+</head>
+<body>
+<h1>Spotify → OLED Lyrics Bridge</h1>
+
+<div class="card">
+  <label for="clientId">Spotify Client ID</label>
+  <input id="clientId" type="text" placeholder="paste from developer.spotify.com/dashboard" autocomplete="off">
+  <div class="small" style="margin-top:6px">Redirect URI to register in your Spotify app: <code id="redir"></code></div>
+  <div class="row">
+    <button id="loginBtn">Log in to Spotify</button>
+    <span><span id="spDot" class="dot"></span> Spotify</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="bleBtn">Connect display</button>
+    <span><span id="bleDot" class="dot"></span> <span id="bleName">BLE</span></span>
+  </div>
+  <label for="offset" style="margin-top:10px">Lyric offset: <span id="offVal">200</span> ms early</label>
+  <input id="offset" type="range" min="-1000" max="1500" step="50" value="200" style="width:100%">
+</div>
+
+<div class="card">
+  <div id="now">Nothing playing</div>
+  <div id="artist"></div>
+  <div id="lyric"></div>
+</div>
+
+<div class="card"><div id="log"></div></div>
+
+<script>
+// ================= config =================
+const SCOPES = 'user-read-currently-playing user-read-playback-state';
+const REDIRECT_URI = location.origin + location.pathname;
+const POLL_MS = 3000;        // Spotify poll interval
+const TICK_MS = 100;         // lyric sync tick
+const KEEPALIVE_MS = 10000;  // Arduino drops to idle after 30 s of silence
+
+const $ = id => document.getElementById(id);
+$('redir').textContent = REDIRECT_URI;
+const log = m => { const el = $('log'); el.textContent = `${new Date().toLocaleTimeString()} ${m}\n` + el.textContent.slice(0, 4000); };
+
+// Small storage wrapper (tokens + client id survive a reload)
+const store = {
+  get: k => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} },
+};
+$('clientId').value = store.get('clientId') || '';
+$('clientId').onchange = e => store.set('clientId', e.target.value.trim());
+
+let offsetMs = +(store.get('offset') ?? 200);
+$('offset').value = offsetMs; $('offVal').textContent = offsetMs;
+$('offset').oninput = e => { offsetMs = +e.target.value; $('offVal').textContent = offsetMs; store.set('offset', offsetMs); };
+
+// ================= Spotify auth (PKCE) =================
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+
+async function login() {
+  const clientId = $('clientId').value.trim();
+  if (!clientId) return alert('Paste your Spotify Client ID first.');
+  store.set('clientId', clientId);
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(64)));
+  store.set('pkce_verifier', verifier);
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const p = new URLSearchParams({
+    client_id: clientId, response_type: 'code', redirect_uri: REDIRECT_URI,
+    code_challenge_method: 'S256', code_challenge: challenge, scope: SCOPES,
+  });
+  location.href = 'https://accounts.spotify.com/authorize?' + p;
+}
+
+async function tokenRequest(params) {
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: store.get('clientId'), ...params }),
+  });
+  if (!r.ok) throw new Error('token ' + r.status + ' ' + await r.text());
+  const t = await r.json();
+  store.set('access_token', t.access_token);
+  if (t.refresh_token) store.set('refresh_token', t.refresh_token);
+  store.set('expires_at', Date.now() + (t.expires_in - 60) * 1000);
+}
+
+async function handleRedirect() {
+  const code = new URLSearchParams(location.search).get('code');
+  if (!code) return;
+  history.replaceState({}, '', REDIRECT_URI);
+  await tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI, code_verifier: store.get('pkce_verifier') });
+  log('Spotify login OK');
+}
+
+async function accessToken() {
+  if (!store.get('access_token')) return null;
+  if (Date.now() > +store.get('expires_at')) {
+    await tokenRequest({ grant_type: 'refresh_token', refresh_token: store.get('refresh_token') });
+  }
+  return store.get('access_token');
+}
+
+// ================= BLE (HM-10: service FFE0, characteristic FFE1) =================
+let bleChar = null, bleDevice = null, writeChain = Promise.resolve();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function connectBle() {
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [0xFFE0] }, { namePrefix: 'HM' }, { namePrefix: 'BT05' }, { namePrefix: 'MLT' }, { namePrefix: 'DSD' }],
+      optionalServices: [0xFFE0],
+    });
+    bleDevice.addEventListener('gattserverdisconnected', onBleDisconnect);
+    await gattConnect();
+  } catch (e) { log('BLE: ' + e.message); }
+}
+
+async function gattConnect() {
+  const server = await bleDevice.gatt.connect();
+  const svc = await server.getPrimaryService(0xFFE0);
+  bleChar = await svc.getCharacteristic(0xFFE1);
+  $('bleDot').classList.add('on'); $('bleName').textContent = bleDevice.name || 'Display';
+  log('BLE connected');
+  resendAll();
+}
+
+async function onBleDisconnect() {
+  bleChar = null; $('bleDot').classList.remove('on');
+  log('BLE disconnected, retrying…');
+  for (let i = 0; i < 10 && !bleChar; i++) {
+    await sleep(2000);
+    try { await gattConnect(); } catch {}
+  }
+}
+
+// The OLED font is ASCII only: strip accents, map smart punctuation, drop the rest.
+function toAscii(s) {
+  return (s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[‘’ʼ]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, '-').replace(/…/g, '...')
+    .replace(/[^\x20-\x7E]/g, '?');
+}
+
+// Serialize writes; HM-10 takes 20-byte chunks and the Uno's SoftwareSerial is slow.
+function send(type, text) {
+  const line = `${type}:${toAscii(text).slice(0, 120)}\n`;
+  const bytes = new TextEncoder().encode(line);
+  writeChain = writeChain.then(async () => {
+    if (!bleChar) return;
+    try {
+      for (let i = 0; i < bytes.length; i += 20) {
+        await bleChar.writeValueWithoutResponse(bytes.slice(i, i + 20));
+        await sleep(25);
+      }
+    } catch (e) { log('write: ' + e.message); }
+  });
+}
+
+// ================= Lyrics (LRCLIB, free, no key) =================
+function parseLrc(lrc) {
+  const out = [];
+  for (const raw of lrc.split('\n')) {
+    const stamps = [...raw.matchAll(/\[(\d+):(\d+(?:\.\d+)?)\]/g)];
+    if (!stamps.length) continue;
+    const text = raw.replace(/\[[^\]]*\]/g, '').trim();
+    for (const m of stamps) out.push({ t: (+m[1] * 60 + +m[2]) * 1000, text });
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+async function fetchLyrics(track) {
+  const artist = track.artists.map(a => a.name)[0];
+  const base = 'https://lrclib.net/api/';
+  const tries = [
+    base + 'get?' + new URLSearchParams({ track_name: track.name, artist_name: artist, album_name: track.album.name, duration: Math.round(track.duration_ms / 1000) }),
+    base + 'search?' + new URLSearchParams({ track_name: track.name, artist_name: artist }),
+  ];
+  for (const url of tries) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      let data = await r.json();
+      if (Array.isArray(data)) data = data.find(d => d.syncedLyrics) || data[0];
+      if (!data) continue;
+      if (data.instrumental) return { status: '(instrumental)' };
+      if (data.syncedLyrics) return { lines: parseLrc(data.syncedLyrics) };
+      if (data.plainLyrics) return { status: 'Only unsynced lyrics found' };
+    } catch (e) { log('lrclib: ' + e.message); }
+  }
+  return { status: 'No lyrics found' };
+}
+
+// ================= State + loops =================
+let current = null;            // { id, title, artist, durationMs }
+let lyrics = null;             // { lines } or { status }
+let progressBase = 0, progressAt = 0, playing = false;
+let lastSentIdx = -2;
+
+function resendAll() {
+  if (!current) return;
+  send('T', current.title); send('A', current.artist); send('P', playing ? '0' : '1');
+  lastSentIdx = -2; // force lyric resend on next tick
+}
+
+async function poll() {
+  try {
+    const tok = await accessToken();
+    if (!tok) { $('spDot').classList.remove('on'); return; }
+    const r = await fetch('https://api.spotify.com/v1/me/player/currently-playing', { headers: { Authorization: 'Bearer ' + tok } });
+    if (r.status === 429) { log('Rate limited by Spotify'); return; }
+    if (r.status === 401) { store.set('expires_at', 0); return; }
+    $('spDot').classList.add('on');
+    if (r.status === 204) { if (playing) { playing = false; send('P', '1'); } return; }
+    const d = await r.json();
+    if (!d.item || d.currently_playing_type !== 'track') return;
+
+    progressBase = d.progress_ms; progressAt = performance.now();
+    if (d.is_playing !== playing) { playing = d.is_playing; send('P', playing ? '0' : '1'); }
+
+    if (!current || current.id !== d.item.id) {
+      current = { id: d.item.id, title: d.item.name, artist: d.item.artists.map(a => a.name).join(', ') };
+      $('now').textContent = current.title; $('artist').textContent = current.artist; $('lyric').textContent = '…';
+      log('Now playing: ' + current.title);
+      lyrics = null; lastSentIdx = -2;
+      send('T', current.title); send('A', current.artist); send('S', 'Loading lyrics...');
+      const id = current.id;
+      const l = await fetchLyrics(d.item);
+      if (current && current.id === id) { lyrics = l; lastSentIdx = -2; }
+    }
+  } catch (e) { log('poll: ' + e.message); }
+}
+
+function tick() {
+  if (!current || !lyrics) return;
+  if (lyrics.status) {
+    if (lastSentIdx !== -3) { send('S', lyrics.status); $('lyric').textContent = lyrics.status; lastSentIdx = -3; }
+    return;
+  }
+  const pos = progressBase + (playing ? performance.now() - progressAt : 0) + offsetMs;
+  let idx = -1;
+  for (let i = 0; i < lyrics.lines.length && lyrics.lines[i].t <= pos; i++) idx = i;
+  if (idx !== lastSentIdx) {
+    lastSentIdx = idx;
+    const text = idx >= 0 ? lyrics.lines[idx].text : '';
+    const shown = text || '\u266A';      // instrumental gap
+    $('lyric').textContent = shown;
+    send('L', text ? text : '~ ~ ~');
+  }
+}
+
+// Keep-alive so the display doesn't time out during long instrumental gaps
+setInterval(() => { if (current) send('P', playing ? '0' : '1'); }, KEEPALIVE_MS);
+
+// Keep the phone awake; browsers throttle timers when the screen is off
+async function keepAwake() {
+  try { await navigator.wakeLock?.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') keepAwake(); });
+
+// ================= boot =================
+$('loginBtn').onclick = login;
+$('bleBtn').onclick = connectBle;
+if (!navigator.bluetooth) log('Web Bluetooth not available here. Use Chrome on Android (or Bluefy on iPhone).');
+
+handleRedirect().catch(e => log(e.message)).finally(() => {
+  keepAwake();
+  poll(); setInterval(poll, POLL_MS);
+  setInterval(tick, TICK_MS);
+});
+</script>
+</body>
+</html>
