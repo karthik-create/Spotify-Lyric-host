@@ -41,8 +41,10 @@
   <div class="row">
     <button id="bleBtn">Connect display</button>
     <button id="testBtn" class="secondary">Test display</button>
+    <button id="viewBtn" class="secondary">Switch view</button>
     <span><span id="bleDot" class="dot"></span> <span id="bleName">BLE</span></span>
   </div>
+  <label style="margin-top:10px"><input type="checkbox" id="autoCover"> Also show the cover for a few seconds when a song starts (in lyrics view)</label>
   <label for="offset" style="margin-top:10px">Lyric offset: <span id="offVal">200</span> ms early</label>
   <input id="offset" type="range" min="-1000" max="1500" step="50" value="200" style="width:100%">
 </div>
@@ -128,6 +130,19 @@ async function accessToken() {
 // ================= BLE (HM-10: service FFE0, characteristic FFE1) =================
 let bleChar = null, bleDevice = null, writeChain = Promise.resolve();
 let withResponse = false;     // acknowledged writes = built-in flow control, if the module supports it
+const listening = new WeakSet();
+let rxBuf = '';
+// Messages from the Arduino. "B" = push button pressed.
+function onBleData(e) {
+  rxBuf += new TextDecoder().decode(e.target.value);
+  let nl;
+  while ((nl = rxBuf.indexOf('\n')) >= 0) {
+    const msg = rxBuf.slice(0, nl).trim();
+    rxBuf = rxBuf.slice(nl + 1);
+    if (msg === 'B') { log('Button pressed'); toggleView(); }
+  }
+  if (rxBuf.length > 64) rxBuf = '';
+}
 let connecting = false, userDisconnected = false, drops = 0;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -156,6 +171,13 @@ async function gattConnect() {
     const svc = await server.getPrimaryService(0xFFE0);
     const ch = await svc.getCharacteristic(0xFFE1);
     withResponse = !!ch.properties.write;
+    if (!listening.has(ch)) {
+      try {
+        await ch.startNotifications();
+        ch.addEventListener('characteristicvaluechanged', onBleData);
+        listening.add(ch);
+      } catch (e) { log('Push button won\'t work (no notifications): ' + e.message); }
+    }
     bleChar = ch;
     $('bleDot').classList.add('on'); $('bleName').textContent = bleDevice.name || 'Display';
     log(`BLE connected (${withResponse ? 'acknowledged' : 'paced'} writes)`);
@@ -230,8 +252,19 @@ const wctx = work.getContext('2d', { willReadFrequently: true });
 const graphemes = s => window.Intl?.Segmenter
   ? [...new Intl.Segmenter().segment(s)].map(g => g.segment) : Array.from(s);
 
+// Splits a word that's too wide for the line into grapheme chunks.
+function splitWord(w, maxW) {
+  if (wctx.measureText(w).width <= maxW) return [w];
+  const out = []; let cur = '';
+  for (const g of graphemes(w)) {
+    if (cur && wctx.measureText(cur + g).width > maxW) { out.push(cur); cur = g; } else cur += g;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 function wrapLines(text, maxW) {
-  const words = text.split(/\s+/).filter(Boolean), lines = [];
+  const words = text.split(/\s+/).filter(Boolean).flatMap(w => splitWord(w, maxW)), lines = [];
   let cur = '';
   for (const w of words) {
     const t = cur ? cur + ' ' + w : w;
@@ -251,25 +284,25 @@ function ellipsize(line, maxW) {
 
 // Largest font size (maxPx..minPx) at which the text fits in a 128 x h box.
 // If it doesn't fit even at minPx, it's cut with "…" (used for the header).
-function fitText(text, h, maxPx, minPx) {
-  const pages = paginate(text, h, maxPx, minPx);
+function fitText(text, h, maxPx, minPx, w = 128) {
+  const pages = paginate(text, h, maxPx, minPx, w);
   if (pages.length === 1) return pages[0];
   const f = pages[0];
-  f.lines[f.lines.length - 1] = ellipsize(f.lines[f.lines.length - 1] + '…', 126);
+  f.lines[f.lines.length - 1] = ellipsize(f.lines[f.lines.length - 1] + '…', w - 2);
   return f;
 }
 
 // Same, but text too long for one screen is split into several screens.
-function paginate(text, h, maxPx, minPx) {
+function paginate(text, h, maxPx, minPx, w = 128) {
   for (let px = maxPx; px >= minPx; px--) {
     wctx.font = `bold ${px}px ${SCRIPT_FONT}`;
     const lh = Math.ceil(px * 1.2);
-    const lines = wrapLines(text, 126);
-    if (lines.length * lh <= h && lines.every(l => wctx.measureText(l).width <= 128)) return [{ px, lh, lines }];
+    const lines = wrapLines(text, w - 2);
+    if (lines.length * lh <= h && lines.every(l => wctx.measureText(l).width <= w)) return [{ px, lh, lines }];
   }
   wctx.font = `bold ${minPx}px ${SCRIPT_FONT}`;
   const lh = Math.ceil(minPx * 1.2), per = Math.max(1, Math.floor(h / lh));
-  const lines = wrapLines(text, 126).map(l => ellipsize(l, 126)), out = [];
+  const lines = wrapLines(text, w - 2).map(l => ellipsize(l, w - 2)), out = [];
   for (let i = 0; i < lines.length; i += per) out.push({ px: minPx, lh, lines: lines.slice(i, i + per) });
   return out;
 }
@@ -283,11 +316,71 @@ function lyricScreens(text) {
   return pageCache.get(text);
 }
 
-function drawFit(fit, y0, h, color) {
+function drawFit(fit, y0, h, color, x = 64, align = 'center') {
   wctx.font = `bold ${fit.px}px ${SCRIPT_FONT}`;
-  wctx.fillStyle = color; wctx.textAlign = 'center'; wctx.textBaseline = 'middle';
+  wctx.fillStyle = color; wctx.textAlign = align; wctx.textBaseline = 'middle';
   let y = y0 + (h - fit.lines.length * fit.lh) / 2 + fit.lh / 2;
-  for (const l of fit.lines) { wctx.fillText(l, 64, Math.round(y)); y += fit.lh; }
+  for (const l of fit.lines) { wctx.fillText(l, x, Math.round(y)); y += fit.lh; }
+}
+
+// ================= Now Playing screen: album cover + title + artist =================
+// Cover is shrunk to 64x64 and dithered to black/white dots (Atkinson dithering).
+async function loadArt(url) {
+  if (!url) return null;
+  try {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = url;
+    await img.decode();
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(img, 0, 0, 64, 64);
+    const d = x.getImageData(0, 0, 64, 64).data, g = new Float32Array(4096);
+    for (let i = 0; i < 4096; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    // Stretch contrast (ignore the darkest/brightest 2%) so dim covers still show detail
+    const sorted = Array.from(g).sort((a, b) => a - b);
+    const lo = sorted[82], hi = Math.max(sorted[4013], lo + 1);
+    for (let i = 0; i < 4096; i++) g[i] = Math.min(255, Math.max(0, (g[i] - lo) * 255 / (hi - lo)));
+    const bits = new Uint8Array(4096);
+    const spread = (xx, yy, e) => { if (xx >= 0 && xx < 64 && yy < 64) g[yy * 64 + xx] += e; };
+    for (let y = 0; y < 64; y++) for (let xx = 0; xx < 64; xx++) {
+      const i = y * 64 + xx, v = g[i] >= 128 ? 255 : 0, e = (g[i] - v) / 8;
+      bits[i] = v ? 1 : 0;
+      spread(xx + 1, y, e); spread(xx + 2, y, e);
+      spread(xx - 1, y + 1, e); spread(xx, y + 1, e); spread(xx + 1, y + 1, e);
+      spread(xx, y + 2, e);
+    }
+    return bits;
+  } catch (e) { log('Album cover: ' + e.message); return null; }
+}
+
+function sendCard() {
+  if (!current) return;
+  wctx.fillStyle = '#000'; wctx.fillRect(0, 0, 128, 64);
+  if (current.art) {
+    const id = wctx.createImageData(64, 64);
+    for (let i = 0; i < 4096; i++) {
+      const v = current.art[i] ? 255 : 0;
+      id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v; id.data[i * 4 + 3] = 255;
+    }
+    wctx.putImageData(id, 0, 0);
+  } else {                                   // no cover: a music-note placeholder
+    wctx.strokeStyle = '#fff'; wctx.strokeRect(0.5, 0.5, 63, 63);
+    wctx.fillStyle = '#fff'; wctx.font = 'bold 36px sans-serif';
+    wctx.textAlign = 'center'; wctx.textBaseline = 'middle'; wctx.fillText('\u266A', 32, 34);
+  }
+  if (!playing) {                            // pause badge in the cover's corner
+    wctx.fillStyle = '#000'; wctx.fillRect(0, 0, 13, 13);
+    wctx.fillStyle = '#fff'; wctx.fillRect(3, 2, 3, 9); wctx.fillRect(8, 2, 3, 9);
+  }
+  // Text column to the right of the cover: song name on top, artist below a divider
+  const col = 67, w = 128 - col;
+  drawFit(fitText(current.title, 39, 13, 9, w), 0, 39, '#fff', col, 'left');
+  wctx.fillStyle = '#fff'; wctx.fillRect(col, 40, w - 2, 1);
+  drawFit(fitText(current.artist, 22, 11, 9, w), 42, 22, '#fff', col, 'left');
+  view = 'card';
+  const seq = ++lyricSeq;
+  enqueue(packPages(0, 8), () => seq === lyricSeq);
 }
 
 // Pack canvas rows into SSD1306 pages (each byte = 8 vertical pixels, LSB on top).
@@ -371,6 +464,30 @@ let current = null;            // { id, title, artist, durationMs }
 let lyrics = null;             // { lines } or { status }
 let progressBase = 0, progressAt = 0, playing = false;
 let lastSentIdx = -2;
+let view = 'lyrics';           // 'card' = album cover screen, 'lyrics' = header + lyrics
+let cardUntil = 0;             // keep the cover up at least until this time
+const CARD_MIN_MS = 5000;
+let userMode = store.get('viewMode') === 'cover' ? 'cover' : 'lyrics';
+const cardEnabled = () => $('autoCover').checked;
+$('autoCover').checked = store.get('autoCover') === '1';
+$('autoCover').onchange = e => store.set('autoCover', e.target.checked ? '1' : '0');
+
+// Push button / "Switch view": flip between lyrics and the album cover screen.
+function toggleView() {
+  if (!current) { log('Nothing playing to switch'); return; }
+  userMode = view === 'card' ? 'lyrics' : 'cover';
+  store.set('viewMode', userMode);
+  cardUntil = 0;
+  if (userMode === 'cover') sendCard(); else showLyricsView();
+  $('viewBtn').textContent = userMode === 'cover' ? 'Show lyrics' : 'Show cover';
+}
+
+function showLyricsView() {
+  view = 'lyrics';
+  lyricSeq++;                  // cancel a cover picture that hasn't been sent yet
+  sendHeader();
+  lastSentIdx = -2;            // lyric area gets redrawn on the next tick
+}
 
 function resendAll() {
   if (!current) {
@@ -379,8 +496,8 @@ function resendAll() {
     sendLyric(store.get('access_token') ? 'Play a song on Spotify' : 'Log in to Spotify on phone', 'S');
     return;
   }
-  sendHeader();
-  lastSentIdx = -2; // force lyric resend on next tick
+  if (view === 'card') sendCard();
+  else { sendHeader(); lastSentIdx = -2; }   // force lyric resend on next tick
 }
 
 async function poll() {
@@ -399,26 +516,43 @@ async function poll() {
     if (d.is_playing !== playing) {
       playing = d.is_playing;
       if (current && current.id === d.item.id) {
-        if (needsBitmap(current.title) || needsBitmap(current.artist)) sendHeader();
+        if (view === 'card') sendCard();
+        else if (needsBitmap(current.title) || needsBitmap(current.artist)) sendHeader();
         else send('P', playing ? '0' : '1');
       }
     }
 
     if (!current || current.id !== d.item.id) {
-      current = { id: d.item.id, title: d.item.name, artist: d.item.artists.map(a => a.name).join(', ') };
+      current = { id: d.item.id, title: d.item.name, artist: d.item.artists.map(a => a.name).join(', '), art: null };
       $('now').textContent = current.title; $('artist').textContent = current.artist; $('lyric').textContent = '…';
       log('Now playing: ' + current.title);
       lyrics = null; lastSentIdx = -2;
-      sendHeader(); sendLyric('Loading lyrics...', 'S');
       const id = current.id;
-      const l = await fetchLyrics(d.item);
-      if (current && current.id === id) { lyrics = l; lastSentIdx = -2; }
+      // Smallest cover that's at least 64 px (Spotify lists 640, 300, 64)
+      const imgs = (d.item.album.images || []).slice().sort((a, b) => a.width - b.width);
+      const artUrl = (imgs.find(i => i.width >= 64) || imgs[imgs.length - 1] || {}).url;
+      const [art, l] = await Promise.all([loadArt(artUrl), fetchLyrics(d.item)]);
+      if (!current || current.id !== id) return;
+      current.art = art;
+      lyrics = l; lastSentIdx = -2;
+      if (userMode === 'cover') { cardUntil = Infinity; sendCard(); }
+      else if (cardEnabled()) { cardUntil = performance.now() + CARD_MIN_MS; sendCard(); }
+      else { view = 'lyrics'; sendHeader(); }
     }
   } catch (e) { log('poll: ' + e.message); }
 }
 
 function tick() {
   if (!current || !lyrics) return;
+  if (view === 'card') {
+    if (userMode === 'cover') return;           // button chose the cover: stay on it
+    // Stay on the cover for no-lyric songs; otherwise switch just before the first line
+    if (lyrics.status) { $('lyric').textContent = lyrics.status; return; }
+    const p = progressBase + (playing ? performance.now() - progressAt : 0) + offsetMs;
+    if (!lyrics.lines.length) return;
+    if (performance.now() < cardUntil || lyrics.lines[0].t > p + bitmapLeadMs() + 1500) return;
+    showLyricsView();
+  }
   if (lyrics.status) {
     if (lastSentIdx !== -3) { sendLyric(lyrics.status, 'S'); $('lyric').textContent = lyrics.status; lastSentIdx = -3; }
     return;
@@ -464,6 +598,8 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 // ================= boot =================
 $('loginBtn').onclick = login;
 $('bleBtn').onclick = connectBle;
+$('viewBtn').onclick = toggleView;
+$('viewBtn').textContent = userMode === 'cover' ? 'Show lyrics' : 'Show cover';
 $('testBtn').onclick = () => {
   if (!bleChar) return log('Test: display not connected');
   send('T', 'Test OK'); send('A', 'Hello from phone');
