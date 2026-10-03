@@ -129,7 +129,7 @@ async function accessToken() {
 
 // ================= BLE (HM-10: service FFE0, characteristic FFE1) =================
 let bleChar = null, bleDevice = null, writeChain = Promise.resolve();
-let withResponse = false;     // acknowledged writes = built-in flow control, if the module supports it
+let withResponse = false;     // only used if the module can't do plain writes (acknowledged writes are slow and flaky on HM-10 clones)
 const listening = new WeakSet();
 let rxBuf = '';
 // Messages from the Arduino. "B" = push button pressed.
@@ -170,7 +170,7 @@ async function gattConnect() {
     const server = bleDevice.gatt.connected ? bleDevice.gatt : await bleDevice.gatt.connect();
     const svc = await server.getPrimaryService(0xFFE0);
     const ch = await svc.getCharacteristic(0xFFE1);
-    withResponse = !!ch.properties.write;
+    withResponse = !ch.properties.writeWithoutResponse && !!ch.properties.write;
     if (!listening.has(ch)) {
       try {
         await ch.startNotifications();
@@ -180,7 +180,7 @@ async function gattConnect() {
     }
     bleChar = ch;
     $('bleDot').classList.add('on'); $('bleName').textContent = bleDevice.name || 'Display';
-    log(`BLE connected (${withResponse ? 'acknowledged' : 'paced'} writes)`);
+    log(`BLE connected (${withResponse ? 'acknowledged' : 'paced'} writes, ${chunkGap} ms per chunk)`);
     await sleep(300);           // let the module settle before the first burst
     resendAll();
   } finally { connecting = false; }
@@ -211,7 +211,9 @@ function toAscii(s) {
 // stillWanted() is checked just before sending, so stale lyric frames get skipped.
 // Pacing keeps below the module's 9600 baud (960 bytes/s) so its buffer never overflows;
 // cheap HM-10 clones crash and drop the link when flooded.
-const CHUNK_GAP_MS = 30;      // ~650 bytes/s
+// Gap between 20-byte chunks. Starts at 30 ms (~650 bytes/s) and grows by itself
+// whenever a send fails, until the module copes; remembered for next time.
+let chunkGap = Math.min(80, Math.max(30, +(store.get('chunkGap') || 30)));
 let sendRate = 650;           // measured bytes/s, used to start Tamil pictures early enough
 function enqueue(bytes, stillWanted = () => true) {
   writeChain = writeChain.then(async () => {
@@ -223,13 +225,19 @@ function enqueue(bytes, stillWanted = () => true) {
         const part = bytes.slice(i, i + 20);
         if (withResponse) await ch.writeValueWithResponse(part);
         else await ch.writeValueWithoutResponse(part);
-        await sleep(CHUNK_GAP_MS);
+        await sleep(chunkGap);
       }
       if (bytes.length > 100) {
         sendRate = 0.7 * sendRate + 0.3 * (bytes.length / ((performance.now() - t0) / 1000));
         await sleep(100);                       // let the Uno finish drawing the picture
       }
-    } catch (e) { log('write: ' + e.message); }
+    } catch (e) {
+      log('write: ' + e.message);
+      if (chunkGap < 80 && !/disconnected/i.test(e.message)) {   // a dropped link isn't a speed problem
+        chunkGap += 10; store.set('chunkGap', chunkGap);
+        log(`Sending slower from now on (${chunkGap} ms per chunk)`);
+      }
+    }
   }).catch(() => {});
 }
 
