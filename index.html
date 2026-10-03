@@ -61,7 +61,7 @@ const SCOPES = 'user-read-currently-playing user-read-playback-state';
 const REDIRECT_URI = location.origin + location.pathname;
 const POLL_MS = 3000;        // Spotify poll interval
 const TICK_MS = 100;         // lyric sync tick
-const KEEPALIVE_MS = 10000;  // Arduino drops to idle after 30 s of silence
+const KEEPALIVE_MS = 10000;  // Arduino drops to idle after 60 s of silence
 
 const $ = id => document.getElementById(id);
 $('redir').textContent = REDIRECT_URI;
@@ -127,34 +127,53 @@ async function accessToken() {
 
 // ================= BLE (HM-10: service FFE0, characteristic FFE1) =================
 let bleChar = null, bleDevice = null, writeChain = Promise.resolve();
+let withResponse = false;     // acknowledged writes = built-in flow control, if the module supports it
+let connecting = false, userDisconnected = false, drops = 0;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function connectBle() {
   try {
-    bleDevice = await navigator.bluetooth.requestDevice({
+    const dev = await navigator.bluetooth.requestDevice({
       filters: [{ services: [0xFFE0] }, { namePrefix: 'HM' }, { namePrefix: 'BT05' }, { namePrefix: 'MLT' }, { namePrefix: 'DSD' }],
       optionalServices: [0xFFE0],
     });
-    bleDevice.addEventListener('gattserverdisconnected', onBleDisconnect);
+    if (bleDevice && bleDevice !== dev) {
+      bleDevice.removeEventListener('gattserverdisconnected', onBleDisconnect);
+      try { bleDevice.gatt.disconnect(); } catch {}
+    }
+    if (bleDevice !== dev) dev.addEventListener('gattserverdisconnected', onBleDisconnect); // only once per device
+    bleDevice = dev;
+    userDisconnected = false;
     await gattConnect();
   } catch (e) { log('BLE: ' + e.message); }
 }
 
 async function gattConnect() {
-  const server = await bleDevice.gatt.connect();
-  const svc = await server.getPrimaryService(0xFFE0);
-  bleChar = await svc.getCharacteristic(0xFFE1);
-  $('bleDot').classList.add('on'); $('bleName').textContent = bleDevice.name || 'Display';
-  log('BLE connected');
-  resendAll();
+  if (connecting) return;
+  connecting = true;
+  try {
+    const server = bleDevice.gatt.connected ? bleDevice.gatt : await bleDevice.gatt.connect();
+    const svc = await server.getPrimaryService(0xFFE0);
+    const ch = await svc.getCharacteristic(0xFFE1);
+    withResponse = !!ch.properties.write;
+    bleChar = ch;
+    $('bleDot').classList.add('on'); $('bleName').textContent = bleDevice.name || 'Display';
+    log(`BLE connected (${withResponse ? 'acknowledged' : 'paced'} writes)`);
+    await sleep(300);           // let the module settle before the first burst
+    resendAll();
+  } finally { connecting = false; }
 }
 
+// Reconnect for as long as it takes, backing off up to 10 s between tries.
 async function onBleDisconnect() {
   bleChar = null; $('bleDot').classList.remove('on');
-  log('BLE disconnected, retrying…');
-  for (let i = 0; i < 10 && !bleChar; i++) {
-    await sleep(2000);
-    try { await gattConnect(); } catch {}
+  writeChain = Promise.resolve();   // drop anything queued for the old link
+  if (userDisconnected) return;
+  drops++;
+  log(`BLE dropped (${drops} so far), reconnecting…`);
+  for (let i = 0, wait = 1000; !bleChar && !userDisconnected; i++, wait = Math.min(wait * 1.5, 10000)) {
+    await sleep(wait);
+    try { await gattConnect(); } catch (e) { if (i % 5 === 4) log('Still reconnecting: ' + e.message); }
   }
 }
 
@@ -168,16 +187,28 @@ function toAscii(s) {
 
 // Serialize writes; HM-10 takes 20-byte chunks and the Uno's SoftwareSerial is slow.
 // stillWanted() is checked just before sending, so stale lyric frames get skipped.
+// Pacing keeps below the module's 9600 baud (960 bytes/s) so its buffer never overflows;
+// cheap HM-10 clones crash and drop the link when flooded.
+const CHUNK_GAP_MS = 30;      // ~650 bytes/s
+let sendRate = 650;           // measured bytes/s, used to start Tamil pictures early enough
 function enqueue(bytes, stillWanted = () => true) {
   writeChain = writeChain.then(async () => {
     if (!bleChar || !stillWanted()) return;
+    const ch = bleChar, t0 = performance.now();
     try {
       for (let i = 0; i < bytes.length; i += 20) {
-        await bleChar.writeValueWithoutResponse(bytes.slice(i, i + 20));
-        await sleep(25);
+        if (ch !== bleChar) return;             // link dropped mid-message
+        const part = bytes.slice(i, i + 20);
+        if (withResponse) await ch.writeValueWithResponse(part);
+        else await ch.writeValueWithoutResponse(part);
+        await sleep(CHUNK_GAP_MS);
+      }
+      if (bytes.length > 100) {
+        sendRate = 0.7 * sendRate + 0.3 * (bytes.length / ((performance.now() - t0) / 1000));
+        await sleep(100);                       // let the Uno finish drawing the picture
       }
     } catch (e) { log('write: ' + e.message); }
-  });
+  }).catch(() => {});
 }
 
 function send(type, text) {
@@ -188,7 +219,8 @@ function send(type, text) {
 // The Uno's font is English-only, so text in other scripts (Tamil, etc.) is drawn
 // here with the phone's own fonts and sent as raw pixels.
 const SCRIPT_FONT = '"Noto Sans Tamil","Nirmala UI","Latha","Tamil Sangam MN",sans-serif';
-const BITMAP_LEAD_MS = 800;   // a lyric picture takes ~0.8 s to send, so start early
+// A lyric picture is ~770 bytes, so start sending it early (based on the measured speed)
+const bitmapLeadMs = () => Math.min(2500, 800 * 1000 / sendRate + 150);
 const needsBitmap = s => /[^\x00-\x7FÀ-ɏ‘-…]/.test(s || '');
 
 const work = document.createElement('canvas');
@@ -395,7 +427,7 @@ function tick() {
   let idx = -1;
   for (let i = 0; i < lyrics.lines.length && lyrics.lines[i].t <= pos; i++) idx = i;
   // Tamil lines go as pictures and take ~0.8 s to send, so start them early
-  const lead = pos + BITMAP_LEAD_MS;
+  const lead = pos + bitmapLeadMs();
   const next = lyrics.lines[idx + 1];
   if (next && needsBitmap(next.text) && next.t <= lead) idx++;
 
