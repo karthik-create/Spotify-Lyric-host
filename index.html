@@ -40,6 +40,7 @@
 <div class="card">
   <div class="row">
     <button id="bleBtn">Connect display</button>
+    <button id="testBtn" class="secondary">Test display</button>
     <span><span id="bleDot" class="dot"></span> <span id="bleName">BLE</span></span>
   </div>
   <label for="offset" style="margin-top:10px">Lyric offset: <span id="offVal">200</span> ms early</label>
@@ -166,11 +167,10 @@ function toAscii(s) {
 }
 
 // Serialize writes; HM-10 takes 20-byte chunks and the Uno's SoftwareSerial is slow.
-function send(type, text) {
-  const line = `${type}:${toAscii(text).slice(0, 120)}\n`;
-  const bytes = new TextEncoder().encode(line);
+// stillWanted() is checked just before sending, so stale lyric frames get skipped.
+function enqueue(bytes, stillWanted = () => true) {
   writeChain = writeChain.then(async () => {
-    if (!bleChar) return;
+    if (!bleChar || !stillWanted()) return;
     try {
       for (let i = 0; i < bytes.length; i += 20) {
         await bleChar.writeValueWithoutResponse(bytes.slice(i, i + 20));
@@ -178,6 +178,126 @@ function send(type, text) {
       }
     } catch (e) { log('write: ' + e.message); }
   });
+}
+
+function send(type, text) {
+  enqueue(new TextEncoder().encode(`${type}:${toAscii(text).slice(0, 120)}\n`));
+}
+
+// ================= Tamil / non-Latin text → bitmap =================
+// The Uno's font is English-only, so text in other scripts (Tamil, etc.) is drawn
+// here with the phone's own fonts and sent as raw pixels.
+const SCRIPT_FONT = '"Noto Sans Tamil","Nirmala UI","Latha","Tamil Sangam MN",sans-serif';
+const BITMAP_LEAD_MS = 800;   // a lyric picture takes ~0.8 s to send, so start early
+const needsBitmap = s => /[^\x00-\x7FÀ-ɏ‘-…]/.test(s || '');
+
+const work = document.createElement('canvas');
+work.width = 128; work.height = 64;
+const wctx = work.getContext('2d', { willReadFrequently: true });
+
+const graphemes = s => window.Intl?.Segmenter
+  ? [...new Intl.Segmenter().segment(s)].map(g => g.segment) : Array.from(s);
+
+function wrapLines(text, maxW) {
+  const words = text.split(/\s+/).filter(Boolean), lines = [];
+  let cur = '';
+  for (const w of words) {
+    const t = cur ? cur + ' ' + w : w;
+    if (!cur || wctx.measureText(t).width <= maxW) cur = t;
+    else { lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+function ellipsize(line, maxW) {
+  if (wctx.measureText(line).width <= maxW) return line;
+  const g = graphemes(line);
+  while (g.length > 1 && wctx.measureText(g.join('') + '…').width > maxW) g.pop();
+  return g.join('') + '…';
+}
+
+// Largest font size (maxPx..minPx) at which the text fits in a 128 x h box.
+// If it doesn't fit even at minPx, it's cut with "…" (used for the header).
+function fitText(text, h, maxPx, minPx) {
+  const pages = paginate(text, h, maxPx, minPx);
+  if (pages.length === 1) return pages[0];
+  const f = pages[0];
+  f.lines[f.lines.length - 1] = ellipsize(f.lines[f.lines.length - 1] + '…', 126);
+  return f;
+}
+
+// Same, but text too long for one screen is split into several screens.
+function paginate(text, h, maxPx, minPx) {
+  for (let px = maxPx; px >= minPx; px--) {
+    wctx.font = `bold ${px}px ${SCRIPT_FONT}`;
+    const lh = Math.ceil(px * 1.2);
+    const lines = wrapLines(text, 126);
+    if (lines.length * lh <= h && lines.every(l => wctx.measureText(l).width <= 128)) return [{ px, lh, lines }];
+  }
+  wctx.font = `bold ${minPx}px ${SCRIPT_FONT}`;
+  const lh = Math.ceil(minPx * 1.2), per = Math.max(1, Math.floor(h / lh));
+  const lines = wrapLines(text, 126).map(l => ellipsize(l, 126)), out = [];
+  for (let i = 0; i < lines.length; i += per) out.push({ px: minPx, lh, lines: lines.slice(i, i + per) });
+  return out;
+}
+
+const pageCache = new Map();
+function lyricScreens(text) {
+  if (!pageCache.has(text)) {
+    if (pageCache.size > 300) pageCache.clear();
+    pageCache.set(text, paginate(text, 48, 18, 13));
+  }
+  return pageCache.get(text);
+}
+
+function drawFit(fit, y0, h, color) {
+  wctx.font = `bold ${fit.px}px ${SCRIPT_FONT}`;
+  wctx.fillStyle = color; wctx.textAlign = 'center'; wctx.textBaseline = 'middle';
+  let y = y0 + (h - fit.lines.length * fit.lh) / 2 + fit.lh / 2;
+  for (const l of fit.lines) { wctx.fillText(l, 64, Math.round(y)); y += fit.lh; }
+}
+
+// Pack canvas rows into SSD1306 pages (each byte = 8 vertical pixels, LSB on top).
+function packPages(firstPage, pages) {
+  const img = wctx.getImageData(0, firstPage * 8, 128, pages * 8).data;
+  const out = new Uint8Array(3 + pages * 128);
+  out[0] = 0x01; out[1] = firstPage; out[2] = pages;
+  for (let p = 0; p < pages; p++)
+    for (let x = 0; x < 128; x++) {
+      let b = 0;
+      for (let bit = 0; bit < 8; bit++) if (img[((p * 8 + bit) * 128 + x) * 4] > 110) b |= 1 << bit;
+      out[3 + p * 128 + x] = b;
+    }
+  return out;
+}
+
+// Lyric picture area = pages 2-7 (48 px, 3 lines of Tamil). English stays fast plain text.
+// `screen` picks which part of a long line to show (see lyricScreens).
+let lyricSeq = 0;
+function sendLyric(text, type = 'L', screen = 0) {
+  const seq = ++lyricSeq, wanted = () => seq === lyricSeq;
+  if (!needsBitmap(text)) {
+    enqueue(new TextEncoder().encode(`${type}:${toAscii(text).slice(0, 120)}\n`), wanted);
+    return;
+  }
+  const screens = lyricScreens(text);
+  wctx.fillStyle = '#000'; wctx.fillRect(0, 16, 128, 48);
+  drawFit(screens[Math.min(screen, screens.length - 1)], 16, 48, '#fff');
+  enqueue(packPages(2, 6), wanted);
+}
+
+// Header. English: title + artist as text. Tamil etc.: the title drawn in the
+// top bar (pages 0-1); there's no room for a readable Tamil artist name too.
+function sendHeader() {
+  if (!current) return;
+  if (!needsBitmap(current.title) && !needsBitmap(current.artist)) {
+    send('T', current.title); send('A', current.artist); send('P', playing ? '0' : '1');
+    return;
+  }
+  wctx.fillStyle = '#fff'; wctx.fillRect(0, 0, 128, 16);              // inverted title bar
+  drawFit(fitText((playing ? '' : '[II] ') + current.title, 16, 13, 11), 0, 16, '#000');
+  enqueue(packPages(0, 2));
 }
 
 // ================= Lyrics (LRCLIB, free, no key) =================
@@ -221,8 +341,13 @@ let progressBase = 0, progressAt = 0, playing = false;
 let lastSentIdx = -2;
 
 function resendAll() {
-  if (!current) return;
-  send('T', current.title); send('A', current.artist); send('P', playing ? '0' : '1');
+  if (!current) {
+    // Nothing playing yet: still wake the display so we know BLE works
+    send('T', 'Bridge connected');
+    sendLyric(store.get('access_token') ? 'Play a song on Spotify' : 'Log in to Spotify on phone', 'S');
+    return;
+  }
+  sendHeader();
   lastSentIdx = -2; // force lyric resend on next tick
 }
 
@@ -239,14 +364,20 @@ async function poll() {
     if (!d.item || d.currently_playing_type !== 'track') return;
 
     progressBase = d.progress_ms; progressAt = performance.now();
-    if (d.is_playing !== playing) { playing = d.is_playing; send('P', playing ? '0' : '1'); }
+    if (d.is_playing !== playing) {
+      playing = d.is_playing;
+      if (current && current.id === d.item.id) {
+        if (needsBitmap(current.title) || needsBitmap(current.artist)) sendHeader();
+        else send('P', playing ? '0' : '1');
+      }
+    }
 
     if (!current || current.id !== d.item.id) {
       current = { id: d.item.id, title: d.item.name, artist: d.item.artists.map(a => a.name).join(', ') };
       $('now').textContent = current.title; $('artist').textContent = current.artist; $('lyric').textContent = '…';
       log('Now playing: ' + current.title);
       lyrics = null; lastSentIdx = -2;
-      send('T', current.title); send('A', current.artist); send('S', 'Loading lyrics...');
+      sendHeader(); sendLyric('Loading lyrics...', 'S');
       const id = current.id;
       const l = await fetchLyrics(d.item);
       if (current && current.id === id) { lyrics = l; lastSentIdx = -2; }
@@ -257,23 +388,40 @@ async function poll() {
 function tick() {
   if (!current || !lyrics) return;
   if (lyrics.status) {
-    if (lastSentIdx !== -3) { send('S', lyrics.status); $('lyric').textContent = lyrics.status; lastSentIdx = -3; }
+    if (lastSentIdx !== -3) { sendLyric(lyrics.status, 'S'); $('lyric').textContent = lyrics.status; lastSentIdx = -3; }
     return;
   }
   const pos = progressBase + (playing ? performance.now() - progressAt : 0) + offsetMs;
   let idx = -1;
   for (let i = 0; i < lyrics.lines.length && lyrics.lines[i].t <= pos; i++) idx = i;
-  if (idx !== lastSentIdx) {
-    lastSentIdx = idx;
+  // Tamil lines go as pictures and take ~0.8 s to send, so start them early
+  const lead = pos + BITMAP_LEAD_MS;
+  const next = lyrics.lines[idx + 1];
+  if (next && needsBitmap(next.text) && next.t <= lead) idx++;
+
+  // Long Tamil lines are split into screens shown evenly across the line's duration
+  let screen = 0;
+  const line = lyrics.lines[idx];
+  if (line && needsBitmap(line.text)) {
+    const n = lyricScreens(line.text).length;
+    if (n > 1) {
+      const end = lyrics.lines[idx + 1]?.t ?? line.t + 5000;
+      screen = Math.max(0, Math.min(n - 1, Math.floor((lead - line.t) / ((end - line.t) / n))));
+    }
+  }
+
+  const key = idx * 100 + screen;
+  if (key !== lastSentIdx) {
+    const sameLine = Math.floor(lastSentIdx / 100) === idx && lastSentIdx >= 0;
+    lastSentIdx = key;
     const text = idx >= 0 ? lyrics.lines[idx].text : '';
-    const shown = text || '\u266A';      // instrumental gap
-    $('lyric').textContent = shown;
-    send('L', text ? text : '~ ~ ~');
+    if (!sameLine) $('lyric').textContent = text || '\u266A';   // \u266A = instrumental gap
+    sendLyric(text ? text : '~ ~ ~', 'L', screen);
   }
 }
 
 // Keep-alive so the display doesn't time out during long instrumental gaps
-setInterval(() => { if (current) send('P', playing ? '0' : '1'); }, KEEPALIVE_MS);
+setInterval(() => { if (bleChar) send('P', playing ? '0' : '1'); }, KEEPALIVE_MS);
 
 // Keep the phone awake; browsers throttle timers when the screen is off
 async function keepAwake() {
@@ -284,6 +432,12 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 // ================= boot =================
 $('loginBtn').onclick = login;
 $('bleBtn').onclick = connectBle;
+$('testBtn').onclick = () => {
+  if (!bleChar) return log('Test: display not connected');
+  send('T', 'Test OK'); send('A', 'Hello from phone');
+  sendLyric('வணக்கம்! தமிழ் பாடல் வரிகள்', 'S');
+  log('Test message sent');
+};
 if (!navigator.bluetooth) log('Web Bluetooth not available here. Use Chrome on Android (or Bluefy on iPhone).');
 
 handleRedirect().catch(e => log(e.message)).finally(() => {
